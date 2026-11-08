@@ -20,7 +20,7 @@
 """
 from __future__ import annotations
 
-_SOLVERS = ("ippe", "qcqp", "diff")
+_SOLVERS = ("ippe")
 
 
 def plate_size(armor_size):

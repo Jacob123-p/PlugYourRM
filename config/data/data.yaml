@@ -9,7 +9,7 @@ sim:
   # 像素噪声（px）。默认 0 = 理想观测，便于开发与自检可复现；
   # 做贴近真实检测器的评测时建议开 0.3~0.5（旧项目实测 sigma=0.5 时 diff 的 psi 抖动 mean 5.4 度）。
   pixel_noise_sigma: 0.0
-  pnp_method: qcqp
+  pnp_method: ippe
   air_density: 1.2
   gravity: 9.8
   seed: 42
