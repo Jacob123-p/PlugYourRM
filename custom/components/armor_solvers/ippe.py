@@ -1,8 +1,8 @@
 # custom/components/armor_solvers/ippe.py
 """非增强 PnP：原始像素 -> 单应分解 + GN 精化 -> C' 系板位姿。
 
-理论见 docs/design/ippe_derivation.md。投影的两段（camera（RDF）-> 归一化、
-归一化 -> 像素）都调 transform 的函数；雅可比是导数推导，留在本文件。
+投影的两段（camera（RDF）-> 归一化、归一化 -> 像素）都调 transform 的函数；
+雅可比是导数推导，留在本文件。
 """
 from __future__ import annotations
 

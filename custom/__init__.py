@@ -43,9 +43,12 @@ def _pick(kind_cls, name):
 
 
 def boot(*, comm,
-         tracker_name="multi_target",
-         pose_solver_name="tjurm"):
-    """发现实现、拼出 Pipeline，返回给入口交给 keeper 驱动。"""
+         tracker_name=None,
+         pose_solver_name=None):
+    """发现实现、拼出 Pipeline，返回给入口交给 keeper 驱动。
+
+    名字留 None 时取注册表里排第一的那个。
+    """
     ensure_registered()
 
     from core.interfaces.tracker import Tracker

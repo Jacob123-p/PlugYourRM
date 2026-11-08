@@ -69,12 +69,12 @@ PnP 数学链（像素 ↔ C' 的换算归单板求解器，见 custom/component
 
 **每一段对应现实中一个能拿到的量：**
 
-- `world ↔ gimbal`：运动模块维护的 `gimbal.world_pos`
-- `world ↔ camera`：相机自己的 `world_pos` / `world_rpy`（一步到位，不经过 gimbal）
+- `world ↔ gimbal`：`self_state.gimbal.pos`
+- `world ↔ camera`：`self_state.camera.pos` / `self_state.camera.rpy`（一步到位，不经过 gimbal）
 - `gimbal ↔ camera`：电机 yaw / pitch 角 + 机械结构常数
 - `gimbal ↔ muzzle`：同上
-- `camera ↔ pixel`：相机内参 K
-- `pixel ↔ C'`：单板求解器内部处理（解出 C' 位姿后由平台做 C' → G 平移）
+- `camera ↔ pixel`：`self_state.camera.K`
+- `pixel ↔ C'`：单板求解器内部处理；解出 C' 位姿后，C' → G 的平移在你的 `PoseSolver` 里做
 - `abs_camera ↔ gimbal`：相机光心在 gimbal 下的位置
 - `abs_camera ↔ abs_armor`：板中心在 C' 下的位置
 - `abs_armor ↔ armor`：板的安装俯仰和绝对偏航
@@ -133,17 +133,24 @@ pitch_up = math.atan2(dz, hypot(dx, dy))     # 抬头为正
 aim_point = current_pos + velocity * total_delay
 ```
 
-`total_delay` 是"从扣扳机到子弹命中"的总时间（弹道飞行 + 系统延迟）。它由弹道解算给出。简单起见，你可以先写死 `0.2s`。
+`total_delay` 是"从扣扳机到子弹命中"的总时间（弹道飞行 + 系统延迟）。它由弹道解算给出（`custom/components/traj_solvers/`）。简单起见，你可以先写死 `0.2s`。
 
-### 4.4 云台跟随的是"枪口"
+### 4.4 瞄准角是按"枪口"算的
 
-`aim_rate` 和开火门限都是相对**枪口**算的，不是相对云台中心。因为枪口和云台中心有一个安装偏置（配置里的 `muzzle_mount_pos`）。
+`aim_rate`（前馈）应该按**枪口 → 瞄点**的视线算，不是按云台中心——枪口和云台中心有一个安装偏置（配置里的 `muzzle_mount_pos`，车上是 0.2m 量级）。
 
-**如果你不做提前量**，`aim_rate` 不填也能跑——电控没有前馈就是纯 PID 跟踪，会滞后一点。
+同样，`ShotSolution.yaw/pitch` 也从枪口位置解更准：`custom/components/traj_solvers/` 里的解算器就是拿 `self_state.muzzle.pos` 当原点的。近目标上用云台中心先跑通也行，只是会差个零点几度到几度。
+
+**如果你不做前馈**，`aim_rate` 不填也能跑——电控没有前馈就是纯 PID 跟踪，会滞后一点。
 
 ## 五、写 PoseSolver 时会遇到哪些
 
-`PoseSolver.solve(frame, self_state)` 里涉及整条 PnP 数学链。
+`PoseSolver.solve(frame, self_state)` 里涉及整条 PnP 数学链。一次完整的 `solve()` 就四步：
+
+1. 遍历 `frame.detections`
+2. 每块板调单板 PnP（`custom/components/armor_solvers/`）
+3. 把结果从 C' 换到 G（`frame="W"` 时再换到 W）
+4. 打包成 `Observation`——圆靶是例外：`detection.center` 直接透传，别丢进 PnP（见 `bus_and_messages.md` §6.1）
 
 ### 5.1 相机内参 K
 
@@ -180,23 +187,23 @@ R_camera_to_abs_camera = rpy_to_R(camera.rpy)
 - `image_points_2d`：四个像素点（LT / RT / RB / LB）
 - `K`：内参
 - `rot_camera_to_abs_camera`：相机绝对姿态（`R^{C'}_{C1}`）
-- `mount_pitch`：板的安装俯仰（平地假设下 = 装配倾角）
+- `mount_pitch`：板的安装俯仰（rad；平地假设下 = 装配倾角）
 
 输出：
 
 - `pos_C_prime`：板中心在 **C' 系**下的位置
 - `rpy_C_prime`：板在 **C' 系**下的欧拉角
 
-**注意：出口是 C'，不是相机系。** 平台后续会做 C' → G 的平移。
+**注意：出口是 C'，不是相机系。** 从 C' 到 G 的平移要你自己在 `solve()` 里做——`abs_camera_to_gimbal(pos, R, *, camera_pos_gimbal)`，`frame="W"` 时再接一个 `gimbal_to_world`。
 
 ### 5.4 增强 PnP 需要的额外输入
 
 如果你想做"用关节角增强"的 PnP（比如利用板在绝对系下的安装角度先验），你需要：
 
 - `rot_camera_to_abs_camera`：即 `M = R^{C'}_{C1}`，直接从 `rpy_to_R(camera.rpy)` 拿
-- `mount_pitch`：即 `theta_0`，从 `cfg.robot.armor_tilt` / `cfg.outpost.armor_tilt` 拿（平地假设）
+- `mount_pitch`：即 `theta_0`，从 `cfg.robot.armor_tilt` / `cfg.outpost.armor_tilt` 拿（平地假设；配置里写的是**度**，记得 `math.radians`）
 
-**注意**：`mount_pitch` 的语义是"板面在绝对系下的安装俯仰"，**不是**自车 pitch。原实现里加了 `self_state.chassis.rpy[1]`，那是错的——它把自车姿态混进去了。
+**注意**：`mount_pitch` 的语义是"板面在绝对系下的安装俯仰"，**不是**自车 pitch。把 `self_state.chassis.rpy[1]` 混进去是经典错误——那是把自车姿态当成了板的安装角。
 
 ## 六、FLU / RDF 轴序
 
@@ -352,11 +359,11 @@ u = f * x / z,  v = f * y / z
 
 参考 `custom/components/armor_solvers/ippe.py` 里的 `RDF2FLU` 用法——它把 PnP 求解出的 RDF 结果换成 FLU 输出。
 
-### `_mount_pitch` 到底是自车的 pitch 还是目标的 pitch？
+### `mount_pitch` 到底是自车的 pitch 还是目标的 pitch？
 
-**目标的**。平地假设下目标的 pitch = 0，所以 `theta_p = 装配倾角`。
+**目标的**。平地假设下目标的 pitch = 0，所以 `theta_p = 装配倾角`（`cfg.robot.armor_tilt` / `cfg.outpost.armor_tilt`）。
 
-自车的 pitch 只影响"相机看向哪里"，不影响"板装在哪里"。原实现里把自车 pitch 加进去是错的——平地场景下自车 pitch ≈ 0 所以碰巧能跑，一旦自车在坡上就会偏。
+自车的 pitch 只影响"相机看向哪里"，不影响"板装在哪里"。两者在平地上碰巧接近，一旦车在坡上就分家了——把自车 pitch 加进 `mount_pitch` 的算法，平地能跑、上坡必偏。
 
 ### 我能不能不用 transform.py，自己写变换？
 

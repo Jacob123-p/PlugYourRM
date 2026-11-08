@@ -20,7 +20,7 @@ sim 循环（200 Hz）                 custom 循环（300 Hz）
 ──────────────────                 ──────────────────────
 物理步进                             keeper 每 1/300 s 叫 tick
 传感器出检测                          pipeline 从 comm 取最新输入
-电控驱动云台                         跑 pose_solver → tracker → shot_solver
+电控驱动云台                         跑 pose_solver → tracker（火控在里边）
 渲染                                发预测/控制回总线
 ```
 
@@ -66,9 +66,9 @@ sim 循环（200 Hz）                 custom 循环（300 Hz）
 │       ↓                                                  │
 │  publish("pred/robot" | "pred/outpost" | "pred/rune")    │
 │       ↓                                                  │
-│  tracker 内部 ShotSolver.solve → ShotSolution            │
+│  tracker 内部发 ShotSolution                              │
 │       ↓                                                  │
-│  public_bus.publish("control", solution)                 │
+│  publish("control", solution)                            │
 │                                                          │
 └──────────────────────────────────────────────────────────┘
 ```
@@ -124,7 +124,7 @@ class CustomComm:
 **custom 侧调它**：
 
 - `pipeline.tick` 里调 `latest_inputs` 拿输入
-- `tracker` 内部直接 `public_bus().publish(CONTROL, solution)` 发控制（不走 `publish_control`）
+- `tracker` 内部直接 `public_bus().publish(CONTROL, solution)` 发控制——`publish_control` 只是同一件事的便捷写法，当前没人调它
 
 **它只做两件事：收检测+状态，发控制。** 不认识 sim、不知道 sim 的内部结构。
 
@@ -161,7 +161,7 @@ class CustomComm:
 
 ### 6.1 DetectionFrame
 
-一帧检测。**只有 2D 图像点**，不含任何 3D 信息。
+一帧检测。**基本上是 2D 图像点**——唯一的例外是圆靶（符）：传感器直接把靶心 3D 位置放进 `center`。
 
 ```python
 @dataclass
@@ -170,7 +170,7 @@ class Detection:
     image_points_2d: np.ndarray  # (4, 2) 像素四角点，顺序 LT / RT / RB / LB
     armor_size: str = ""          # "small" / "large"
     lit: bool = False             # 只有符用：这块灯臂是否点亮
-    center: Optional[np.ndarray] = None  # 只有圆靶用：靶心 3D 位置
+    center: Optional[np.ndarray] = None  # 只有圆靶用：靶心 3D 位置（世界系）
 
 @dataclass
 class DetectionFrame:
@@ -182,7 +182,7 @@ class DetectionFrame:
 
 - **空帧也发**（`detections=[]`）——采样到了但一块板都没看到，也发一帧，时间戳是新的。下游靠它知道"这一拍是空的"，而不是"沿用上一拍"。**与"没到 `sensor_fps` 采样点"不同**：那种情况 `get_obs` 返回 `None`，不发消息。
 - **不含目标身份**——谁看到哪块板由 tracker 自己维护。
-- **`center` 只有圆靶用**——圆靶没有板面方向可解，跳过 PnP，靶心直接给。
+- **`center` 只有圆靶用**——圆靶没有板面方向可解，跳过 PnP，靶心直接给（世界系）。你的 `PoseSolver` 遇到 `entity_type is Rune` 要把它原样透传，别丢进 PnP。
 
 ### 6.2 SelfState
 
@@ -241,7 +241,7 @@ class Observation:
 - **`rel_pos` 是板的位置，不是车的中心**。一块车上几块板就有几个 `ArmorObservation`。
 - **`rel_rpy[2]` 是板在绝对系下的偏航**——不是相对相机的角度。
 - **消息里没有目标身份**——同一帧看到的两块板，是不是同一辆车的，由 tracker 自己判断。
-- **空帧也发**（`obs_armors=[]`）——有 DetectionFrame 时，pipeline 每帧都发一条 Observation，即使解算端一块板都没解出来。这和 DetectionFrame 的"空帧不发"不同：检测端没有可发的就不发，但解算端把"这一帧没有可用位姿"也当作一次结果告知下游。
+- **空帧也发**（`obs_armors=[]`）——只要这一 tick 有输入（DetectionFrame + SelfState），pipeline 就发一条 Observation，即使一块板都没解出来。检测端和解算端在这点上一致：都是"这一拍看了，结果为空"，而不是让下游沿用上一拍。真正的不发只有一种：没到 `sensor_fps` 采样点。
 
 ### 6.4 Prediction
 
@@ -256,13 +256,13 @@ class Prediction:
     timestamp: float                 # 必须等于输入的 obs.timestamp
     is_tracking: bool
     aim_rate: Optional[np.ndarray] = None
-    gimbal_target: Optional[GimbalTarget] = None
+    gimbal_target: Optional[GimbalTarget] = None  # 扩展位：当前没有消费方
 ```
 
 **要点**：
 
 - **`armors[0]` 是"未来时刻"的位置**——不是当前板位置。Tracker 已按 `total_delay` 前推过。
-- **`timestamp` 必须与输入一致**——渲染靠它对齐。
+- **`timestamp` 必须与输入一致**——它是配对键；目前没有代码强制检查，但你自己做前推、做延迟补偿时全靠它。
 - **一个 tracker 一帧可以发多条**——按 `target_type` 分通道。
 - **火控信息不在本条里**——`fire` / `fire_mode` / `fire_key` 走 `ShotSolution`。
 - **fps 不在这条里**——它是 pipeline 层的度量，走 `PIPELINE_STATS`。
@@ -281,6 +281,7 @@ class ShotSolution:
     fire: bool = False       # 自瞄的推荐："这一帧该不该扣扳机"
     fire_mode: str = "auto"  # "auto"（连发）/ "single"（单发）
     fire_key: Optional[int] = None  # 自瞄估计的"当前瞄的板/灯臂编号"
+    cooldown: float = 0.0    # 自瞄建议的最小两发间隔；0 = 用电控默认
     timestamp: float = 0.0
 ```
 
@@ -288,7 +289,8 @@ class ShotSolution:
 
 - **`pitch` 抬头为正**——`ControlManager` 下发时会取负。
 - **`yaw_rate` / `pitch_rate` 是前馈**——没有前馈，云台 PID 必然滞后于瞄点轨迹。
-- **`fire` 是"推荐"，不是"裁决"**——它说的是"自瞄认为该打了"（板朝向 / 灯臂点亮 / 板接近虚拟点），**不是"云台到位了"**。电控拿到 `fire=True` 后还要做自己的物理检查（跟踪误差、冷却、用户开关）。
+- **`fire` 是"推荐"，不是"裁决"**——它说的是"自瞄认为该打了"（板朝向 / 灯臂点亮 / 板接近虚拟点），**不是"云台到位了"**。电控拿到 `fire=True` 后还要过自己的关：用户开关（KP9 / KP8）、单发判据、冷却。
+- **`cooldown` 是建议值**——留 0 就用电控默认（`cfg.sim.aim.cooldown`，0.1s）；符要给更大的值（比如 0.8s）。
 - **`fire_mode`**：
     - `"auto"`（连发）：`fire=True` 就打，电控按冷却节流。
     - `"single"`（单发）：电控按 `fire_key` 变化或 `fire` 上升沿判"新一发"。
@@ -335,6 +337,8 @@ class PublicMessages:
         return Message(f"pred/{target_type.value}", Prediction)
 ```
 
+**`DEBUG_PLOT` 的字段是曲线面板认的固定键名**（`obs_yaw` / `obs_pitch` / `pred_yaw` / `pred_pitch`，单位 rad），发法见 `docs/writing_your_tracker.md` §五。
+
 **用途**：
 
 - 消费点读 `PublicMessages.DETECTION.dataflow` 就知道 payload 是什么类型。
@@ -367,7 +371,7 @@ EventBus 会把它当成普通 topic。**但不建议**——标准 topic 有文
        publish(OBS)  ← 渲染订阅
        tracker.step(obs, state) → List[Prediction]
        publish(pred/<type>)  ← 渲染订阅
-       tracker 内部 ShotSolver.solve → ShotSolution
+       tracker 内部发 ShotSolution
        publish(CONTROL)  ← SimComm 订阅
        ↓ [public_bus]
 7. SimComm._on_control 缓存最新
@@ -377,16 +381,16 @@ EventBus 会把它当成普通 topic。**但不建议**——标准 topic 有文
 
 **关键点**：
 
-- **`SELF_STATE` 在 `DETECTION` 之前发**——保证 keeper 手里的是同一刻状态。
+- **两条消息背靠背发、中间没有等待**：先 `DETECTION`、后 `SELF_STATE`。custom 的 tick 恰好落在两条之间时，会拿到"新 frame + 旧 state"（§4.3 说过，对自瞄影响可忽略）。
 - **一帧最多发一次**——`pipeline.tick` 里没有输入就什么都不做。
 - **`CONTROL` 到达 sim 侧可能滞后一帧**——`simulator._advance` 里先读 `latest_control`，再产生检测。这一帧读的是上一帧 custom 发的控制。
 
 ## 九、写 Tracker 时要记住的
 
-- **输入是 `Observation`**，不是 `DetectionFrame`。PnP 已经帮你做完了。
+- **输入是 `Observation`**，不是 `DetectionFrame`——PnP 在你自己的 `PoseSolver` 里做完了。
 - **输出是 `List[Prediction]`**。第一条是"该打谁"。
 - **`armors[0]` 是未来时刻的位置**。你要自己前推。
-- **`timestamp` 必须和输入一致**。这一条最容易忘——一旦忘了，渲染会错位。
+- **`timestamp` 必须和输入一致**。这条最容易忘；它现在没有代码检查，但它是你后面前推的时间基准。
 - **坐标是 G 系还是 W 系看 `cfg.sim.frame`**。G 系下不用减 `gimbal.pos`。
 - **火控走 `ShotSolution`**——不是 `Prediction`。要在 tracker 内部算出 `ShotSolution` 并发到 `CONTROL` 通道。
 
@@ -400,9 +404,9 @@ EventBus 会把它当成普通 topic。**但不建议**——标准 topic 有文
 
 1. 你的 tracker 里有没有发 `ShotSolution`（`public_bus().publish(PublicMessages.CONTROL, solution)`）？
 2. `solution.timestamp` 和这一帧的 `obs.timestamp` 一致吗？
-3. 电控的 `reason` 字段是什么？—— `no_solution` / `auto_aiming_off` / `auto_fire_off` / `aim_off` / `track_lag` / `cooldown`……
+3. 电控判了什么？拒绝原因只有这几种：`no_solution` / `auto_aiming_off` / `auto_fire_off` / `aim_off` / `same_target` / `not_rising_edge` / `cooldown`。
 
-`ControlManager._publish_fire` 每条拒绝都带 `reason`，在信息面板或日志里能看到。
+**但 `reason` 发在 `sys_bus` 的 `fire` 事件上，custom 看不到，信息面板也不显示**——想确认就打开 `sim/managers/control_manager.py` 对着看，或者在自己的 `step()` 里 `debug_text(...)` 把当时的判断打出来。
 
 ### 我发了两条 Prediction 但 sim 只认一条？
 
@@ -421,10 +425,9 @@ EventBus 会把它当成普通 topic。**但不建议**——标准 topic 有文
 按顺序检查：
 
 1. **`ControlManager` 的用户开关**：KP9（`auto_aiming`）、KP8（`auto_fire`）都开了吗？
-2. **跟踪误差**：`ControlManager` 有自己的 `track_tol_deg`（默认 0.3°）——云台当前指向和 `solution.yaw` / `solution.pitch` 的差小于它才发。信息面板的 `track_lag` 就是这一条。
-3. **冷却**：距上一发超过 `cooldown`（0.1s）了吗？
-4. **单发判据**：`fire_mode="single"` 时——如果 `fire_key` 非 None（符），看 `fire_key` 是否变；如果为 None（车虚拟点），看 `fire` 是否 0→1。
-5. **`BulletManager` 还要过 `fire_delay`（0.02s）** —— 但这一层很少出错。
+2. **冷却**：距上一发超过 `cooldown`（默认 0.1s，或你在 `ShotSolution.cooldown` 里给的值）了吗？
+3. **单发判据**：`fire_mode="single"` 时——如果 `fire_key` 非 None（符），看 `fire_key` 是否变；如果为 None（车虚拟点），看 `fire` 是否 0→1。
+4. **`BulletManager` 还要过 `fire_delay`（0.02s）** —— 但这一层很少出错。
 
 ## 十一、一句话
 

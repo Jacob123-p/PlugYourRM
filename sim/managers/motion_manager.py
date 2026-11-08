@@ -17,8 +17,6 @@
        归一化不在这里做（归 KeyboardManager）；这里只把 tar_vel 当绝对目标速度用。
 
 预设（KP7 循环）：static / spin_slow / spin_fast / patrol。
-两个 spin 对应自瞄 mode 阈值（MultiTargetParams.spin_thresh = 3.0）的两侧——
-慢速走车 auto（追板），快速走车 single（虚拟点）。
 """
 from __future__ import annotations
 

@@ -2,6 +2,8 @@
 
 > 从一帧观测到一帧预测：Tracker 是什么、怎么跑、怎么一步步做出你想要的 MOT。
 
+**前提**：本文的输入 `Observation` 是你自己写的 `PoseSolver` 产出的——没有它，`obs.obs_armors` 永远是空的。位姿解算怎么做，见 README 和 `docs/coordinate_systems.md`；本文只讲从观测往后的一半。
+
 ## 一、Tracker 是什么
 
 **一句话**：Tracker 是"一帧观测 → 一帧预测"的函数。
@@ -90,6 +92,7 @@ class ShotSolution:
     fire: bool = False       # 自瞄的推荐："这一帧该不该扣扳机"
     fire_mode: str = "auto"  # "auto"（连发）/ "single"（单发）
     fire_key: Optional[int] = None  # 自瞄估计的"当前瞄的板/灯臂编号"
+    cooldown: float = 0.0    # 自瞄建议的最小两发间隔；0 = 用电控默认
     timestamp: float = 0.0
 ```
 
@@ -97,7 +100,8 @@ class ShotSolution:
 
 - **`pitch` 抬头为正**——你只管发抬头为正的 `pitch`，电控会取负。
 - **`yaw_rate` / `pitch_rate` 是前馈**——没有前馈，云台 PID 会滞后于瞄点轨迹。
-- **`fire` 是"推荐"，不是"裁决"**——它说的是"自瞄认为该打了"，不是"云台到位了"。电控还会自己判跟踪误差、冷却、用户开关。
+- **`fire` 是"推荐"，不是"裁决"**——它说的是"自瞄认为该打了"，不是"云台到位了"。电控还会自己判冷却、用户开关、单发判据。
+- **`cooldown` 是建议值**——留 0 就用配置里的默认冷却（`cfg.sim.aim.cooldown`，0.1s）；符要自己给个更大的值（比如 0.8s）。
 - **`fire_mode` / `fire_key` 见 `bus_and_messages.md` §6.5。**
 - **`timestamp` 必须与产生它的那条 `Prediction` 一致**——这是配对键。
 
@@ -105,10 +109,10 @@ class ShotSolution:
 
 ## 四、最小可跑的 Tracker
 
-不看默认实现，从零开始。**目标**：让云台指向最近的那块板。
+**目标**：让云台指向看到的第一块板。
 
 ```python
-# custom/schemes/my_scheme/my_tracker.py
+# custom/schemes/your_scheme/your_tracker.py
 import math
 import numpy as np
 
@@ -132,7 +136,7 @@ class MyFirstTracker(Tracker):
         if obs is None or not obs.obs_armors:
             return []
 
-        # 2) 挑一块最近/最中心的板（这里简化：就挑第一块）
+        # 2) 挑一块板（这里简化：就挑第一块）
         armor = obs.obs_armors[0]
 
         # 3) 按 entity_type 分类
@@ -152,7 +156,7 @@ class MyFirstTracker(Tracker):
             is_tracking=True,
         )
 
-        # 5) 发弹道解——这一步让云台真的动起来
+        # 5) 发 ShotSolution——这一步让云台真的动起来
         #    用观测位置直接算云台该指的 yaw/pitch。
         aim = np.asarray(armor.rel_pos, float)
         # G 系下 rel_pos 已经是相对云台中心；W 系下要先减 gimbal.pos
@@ -175,7 +179,7 @@ class MyFirstTracker(Tracker):
 
 **注册**：`@register_tracker("my_first")` 会自动把它挂进注册表。
 
-**使用**：`python main.py`，选择界面里就会多一行 `my_first`。按 `KP9` 开自瞄、`KP8` 开自动开火——云台会指向板，开火受电控的冷却和跟踪误差节制。
+**使用**：`python main.py`，选择界面里就会多一行 `my_first`。按 `KP9` 开自瞄、`KP8` 开自动开火——云台会指向板，能不能发弹由电控的冷却和你的 `fire` 一起决定。
 
 **你现在能做什么**：
 
@@ -190,7 +194,29 @@ class MyFirstTracker(Tracker):
 
 **这就是升级路径的起点。**
 
-## 五、升级路径
+## 五、调试：让曲线面板有数据
+
+按 `M` 打开曲线面板（`KP4` 切预设），上面两块是 yaw / pitch 折线。`cmd`（指令）和 `act`（实际）由仿真器直读，不用你管；`obs` 和 `pred` 四条要你自己发——不发，面板就一直显示 `no data`。
+
+`obs_*` 是观测板相对云台的角度，`pred_*` 是你发出去的瞄点角度：
+
+```python
+from core.bus.public_bus import debug_plot, debug_text
+
+# 在 step() 里算完角度之后
+debug_plot(obs_yaw=obs_yaw, obs_pitch=obs_pitch,
+           pred_yaw=yaw, pred_pitch=pitch_up)
+
+# 信息面板的 DEBUG 区（只留最近 10 条）
+debug_text(f"fire={fire} dist={dist:.2f}", color=(255, 255, 0))
+```
+
+- `debug_plot(**values)`：键名固定为 `obs_yaw` / `obs_pitch` / `pred_yaw` / `pred_pitch`，单位 **rad**（面板自己转成度）。
+- `debug_text(text, color=(r, g, b))`：发到信息面板的 DEBUG 区。
+
+**调自瞄先看曲线**：`cmd` 和 `act` 的差是伺服滞后，`obs` 和 `pred` 的差是你做了多少前推。这两对曲线都对不上，云台一定打不准。
+
+## 六、升级路径
 
 **每一步只改几十行，但解决一类新问题。** 你不需要一次全做完——按需升级。
 
@@ -267,7 +293,7 @@ def step(self, obs, self_state):
     return [Prediction(center=aim_point, armors=[aim_point], ...)]
 ```
 
-**你学到**：Tracker 的核心难点是**时间**——观测是过去的，枪口要指向未来。
+Tracker 的核心难点是**时间**——观测是过去的，枪口要指向未来。
 
 ### 第 4 步：换 EKF（"打机动目标"）
 
@@ -275,7 +301,7 @@ def step(self, obs, self_state):
 
 **做什么**：上 EKF。状态向量 `[x, y, z, vx, vy, vz]`——位置 + 速度。用观测更新，用过程模型预测。
 
-平台自带 `core.algorithms.filters.extended_kalman`，参考默认实现里的 `models/armor_model.py`。
+平台自带 KF / EKF / UKF（`core/algorithms/filters/`）。照 `extended_kalman.py` 的接口，把"位置 + 速度"写成状态，过程模型自己推。
 
 **你学到**：这是自瞄从"能打"到"能打稳"的分水岭。
 
@@ -285,7 +311,7 @@ def step(self, obs, self_state):
 
 **做什么**：给每辆车一个独立的 EKF；用**马氏距离**把观测匹配到已有目标；新目标没见过就新建；目标消失久了就淘汰。
 
-这就是完整的 MOT。参考 `custom/schemes/tjurm_scheme/pool.py`——但先自己写一版最简的，再看它。
+这就是完整的 MOT。没有现成代码可抄——先写一版最简的（每辆车一个 EKF，观测就近匹配），跑通了再上马氏距离。
 
 **你学到**：多目标的核心是**数据关联**——观测本身不带身份，你得自己判断"这一帧看到的是刚才那辆还是新来的"。
 
@@ -295,7 +321,7 @@ def step(self, obs, self_state):
 
 **做什么**：从跟踪器的状态里算出每一块板的位置（需要**车辆模型**——车绕 Z 转、板的半径和角度），挑一块朝向自车的打。
 
-参考 `custom/components/armor_selectors/tjurm_armor_selector.py`。
+`custom/components/` 里没有现成的选板工具——选板逻辑和你的车辆模型绑死，得自己写：模型给出每块板的位置和法向 → 挑最正对自车的那块。
 
 **你学到**：这是自瞄从"能打"到"打得准"的最后一环。
 
@@ -309,7 +335,7 @@ def step(self, obs, self_state):
 - **前哨**：板法向朝向自车
 - **符**：有灯臂点亮
 
-参考 `custom/components/shooters/tjurm_shooter.py`。
+这一块同样没有现成工具，自己写：拿你模型算出的板位置和法向，判这一帧打不打、打单发还是连发（`fire_mode` / `fire_key`）。
 
 **你学到**：火控是"该不该打"，不是"能不能打"。后者归电控。
 
@@ -317,7 +343,7 @@ def step(self, obs, self_state):
 
 **升级路径不是一次走完的。** 每一步都是一份能跑的 tracker；每一步解决一个具体问题；每一步的代码量在几十行。
 
-## 六、注册与选择
+## 七、注册与选择
 
 注册用装饰器：
 
@@ -327,25 +353,28 @@ class MyFirstTracker(Tracker):
     ...
 ```
 
-- `"my_first"` 是主名——启动界面里显示这个
-- `aliases` 是可选的别名，命令行里可以用
+- `"my_first"` 是主名——启动界面里只显示主名
+- `aliases` 是可选的别名——程序里按名字取实现时（`Tracker.build(...)`）能用，启动界面不显示
 
 **选择**：启动界面的 Tracker 列里选你注册的名字。
 
-**`discover()` 会自动找到你**：`custom/__init__.py` 会扫描 `custom/` 下的所有模块，import 它们——只要你在 `custom/` 的任何位置写一个 `@register_tracker(...)`，启动时就会被认到，不用改任何其他文件。
+**`discover()` 会自动找到你**：`custom/__init__.py` 会扫描 `custom/` 下的所有**包**，import 它们——只要你在 `custom/` 的任何位置写一个 `@register_tracker(...)`，启动时就会被认到，不用改其他文件。
+
+**但目录必须是包**：新建 `custom/schemes/my_scheme/` 时，里面必须有 `__init__.py`（空文件也行）。没有它 `discover()` 不会进这个目录——现象是"代码明明写了，选择界面里没有"。
 
 **重名会报错**：如果两个 tracker 用了同一个主名（或别名），注册时立刻报错，报错信息指向两个类的模块路径。**别怕重名——报错是帮你的。**
 
-## 七、常见问题
+## 八、常见问题
 
 ### 我的 tracker 注册了但没生效？
 
 检查：
 
-1. 类继承 `Tracker`（不是 `PoseSolver`）
-2. 装饰器拼写是 `@register_tracker`（不是 `register_solver`）
-3. 文件在 `custom/` 目录下（`discover()` 只扫 `custom/`）
-4. 启动界面的 Tracker 列里翻到底——如果列表太长可能要往下滚
+1. **目录里有 `__init__.py`**——最常见的原因，见上一节
+2. 类继承 `Tracker`（不是 `PoseSolver`）
+3. 装饰器拼写是 `@register_tracker`（不是 `register_solver`）
+4. 文件在 `custom/` 目录下（`discover()` 只扫 `custom/`）
+5. 启动界面的 Tracker 列里翻到底——如果列表太长可能要往下滚
 
 ### 我的预测点数对不上目标？
 
@@ -363,7 +392,7 @@ class MyFirstTracker(Tracker):
 1. **没做提前量**：飞过去 0.2s，目标也移动了 0.2s 的距离。
 2. **提前量方向错**：你的速度估计反了（观测位置波动、差分公式方向错）。
 3. **用错了坐标**：G 系下的相对量当成绝对量用了。
-4. **时间戳不对**：`solution.timestamp` 和 `obs.timestamp` 不一致——下游会拒绝配对。
+4. **时间戳不对**：`solution.timestamp` 应该等于这一帧的 `obs.timestamp`。目前没有代码检查它，但它是你做前推和配对时唯一的时间基准——一开始就写对。
 
 ### 我能不能一次发多条 Prediction？
 
@@ -373,7 +402,7 @@ class MyFirstTracker(Tracker):
 
 **要。** `total_delay` 是"从扣扳机到子弹命中目标"的总时间——它由弹道飞行时间加上系统延迟组成。你的 tracker 里做前推时要用它。
 
-**怎么算**：默认实现里由弹道迭代给出（`TrajectorySolver.solve` 返回飞行时间 + `fire_delay`）。你如果不做弹道迭代，可以用一个固定值（比如 `0.2s`）先跑通。
+**怎么算**：`custom/components/traj_solvers/` 里的弹道解算器能给出飞行时间；再加上 `cfg.sim.bullet.fire_delay`（0.02s）就是总延迟。不做弹道迭代的话，先用一个固定值（比如 `0.2s`）跑通。
 
 ### 我的 Prediction 发了但云台不动？
 
@@ -383,20 +412,22 @@ class MyFirstTracker(Tracker):
 
 1. 你的 tracker 里有没有 `public_bus().publish(PublicMessages.CONTROL, solution)`？
 2. `solution.timestamp` 和这一帧的 `obs.timestamp` 一致吗？
-3. 电控的 `reason` 字段是什么？—— 在信息面板看 `reason`。
+3. `KP9`（`auto_aiming`）开了吗？—— 没开的话电控直接不接你的解算。
 
 ### 我的 `fire=True` 但子弹不出膛？
 
 按顺序检查：
 
 1. **用户开关**：KP9（`auto_aiming`）、KP8（`auto_fire`）都开了吗？
-2. **跟踪误差**：电控有 `track_tol_deg`（默认 0.3°）——云台当前指向和 `solution.yaw` / `solution.pitch` 的差小于它才发。
-3. **冷却**：距上一发超过 `cooldown`（0.1s）了吗？
-4. **单发判据**：`fire_mode="single"` 时——如果 `fire_key` 非 None（符），看 `fire_key` 是否变；如果为 None（车虚拟点），看 `fire` 是否 0→1。
+2. **冷却**：距上一发超过 `cooldown`（默认 0.1s，或你在 `ShotSolution.cooldown` 里给的值）了吗？
+3. **单发判据**：`fire_mode="single"` 时——`fire_key` 非 None（符）就看它变没变；为 None（虚拟点）就看 `fire` 有没有 0→1。
+4. **`timestamp`**：和这一帧的 `obs.timestamp` 对得上吗？
 
-这些 `reason` 都能在信息面板或日志里看到。
+**电控不会主动报"为什么没发"**——它把判据结果发到 `sys_bus` 上，而 custom 看不到那条总线。怀疑哪一条，就在自己的 `step()` 里 `debug_text(...)` 把判断打出来。
 
-## 八、一句话
+**打没打中**：信息面板的 HEALTH 会掉血；符的"命中 / 未计入"会以文本出现在 DEBUG 区。
+
+## 九、一句话
 
 **Tracker 是"一帧进一帧出"的函数。**
 

@@ -58,8 +58,8 @@ core 不知道自己会为谁服务。它定义"消息长什么样"和"扩展点
 
 `core/interfaces/` 定义两个扩展点：
 
-- **`Tracker`** —— 一份完整的 MOT 方案。`step(obs, self_state) -> List[Prediction]`。
 - **`PoseSolver`** —— 帧级位姿解算。`solve(frame, self_state) -> Observation`。
+- **`Tracker`** —— 跟踪 + 火控。`step(obs, self_state) -> List[Prediction]`；火控是它内部自己发 `ShotSolution`。
 
 两者都继承 `Registry`，用 `@register_*` 装饰器注册，在启动界面里被挑选。
 
@@ -108,7 +108,7 @@ physics / motion / sensor            keeper 按 fps 叫 pipeline.tick
   ↓ publish_frame                        ↓ latest_inputs
 [public_bus]                            [public_bus]
   ↑ latest_control                       ↑ publish_control
-control / render                     pose_solver → tracker → shot_solver
+control / render                     pose_solver → tracker（火控在 tracker 内）
 ```
 
 **关键点**：谁快谁慢都不影响对方——慢的一侧读到的永远是"最新那一份"，不是积压的旧值。
@@ -123,23 +123,22 @@ control / render                     pose_solver → tracker → shot_solver
 
 ### 5.1 schemes —— 方案
 
-一份**完整的 MOT 实现**。包含：
+一份**自瞄实现**。包含：
 
-- 一个 `Tracker` 实现（方案主体）
-- 一个 `PoseSolver` 实现（帧级解算）
-- 方案内部私有代码：模型、目标池、射击决策
+- 一个 `PoseSolver` 实现（帧级解算：检测 → 观测）
+- 一个 `Tracker` 实现（跟踪 + 火控：观测 → 预测 + `ShotSolution`）
+- 方案内部私有代码：模型、目标池、射击决策——怎么组织随你
 
 ```
-custom/schemes/tjurm_scheme/
-  tracker.py            注册为 "multi_target"
-  pose_solver.py        注册为 "tjurm"
-  pool.py               目标池（方案私有）
-  shot_solver.py        一发解：model→select→traj 迭代（方案私有）
-  models/               EKF 模型（方案私有）
-  mpc/                  MPC 扩展（方案私有，默认关闭）
+custom/schemes/your_scheme/
+  __init__.py           包标记（没有它 discover() 扫不到）
+  your_pose_solver.py   注册为 "yours"
+  your_tracker.py       注册为 "yours"
 ```
 
-**方案之间不共享代码。** 你想写第二份方案，就复制一份新目录、改内部、换 `@register_*` 的名字。
+`your_scheme/` 是发下来的骨架：`solve()` 不产出观测、`step()` 不产出预测。把这两个文件写完，方案才会动。
+
+**方案之间不共享代码。** 想写第二份方案，就复制一份新目录、改内部、换 `@register_*` 的名字。
 
 ### 5.2 components —— 组件
 
@@ -147,15 +146,15 @@ custom/schemes/tjurm_scheme/
 
 ```
 custom/components/
-  armor_solvers/       单板 PnP 求解器（diff / qcqp / ippe）
+  armor_solvers/       单板 PnP 求解器（当前只有 ippe）
   traj_solvers/        弹道解算器
-  armor_selectors/     选板策略
-  shooters/            射击决策
 ```
 
 判据：**能脱离任何具体 scheme 独立使用吗？** 能 → 这里；不能 → scheme 私有。
 
 **组件不是接口。** 它们是普通类——不注册、不出现在启动界面、方案内部自己 `import`、自己 `new`。
+
+**选板、火控、多目标关联不在这里。** 它们和你的模型强绑定（模型长什么样、状态向量怎么排，只有你自己知道），属于方案，自己写在 `schemes/` 里。
 
 ### 5.3 pipeline —— custom 内编排
 
@@ -201,7 +200,7 @@ def tick():
 
 1. **消息格式** —— `DetectionFrame` / `SelfState` / `Observation` / `Prediction` / `ShotSolution` 的字段 + 语义 + 坐标系约定。
 2. **时序** —— sim 一帧发一次输入，custom 一帧最多发一次输出，`timestamp` 一致。
-3. **方案粒度** —— 一个方案 = 一个注册的 `Tracker`。
+3. **方案粒度** —— 一个方案 = 一个 `PoseSolver` + 一个 `Tracker`（启动界面的两列各选一个）。
 
 **变化的（custom 自由决定）：**
 
@@ -235,7 +234,7 @@ def tick():
 
 **方案是变化的、组件是预判的。**
 
-- 方案：一份完整实现。学生写自己的方案时，从零开始或者 copy 一份——他改的东西和他写的代码在同一个目录里。
+- 方案：一份完整实现。学生写自己的方案时，从骨架开始或者 copy 一份——他改的东西和他写的代码在同一个目录里。
 - 组件：所有方案可能都用得上的工具。它们是**库**——不是抽象层、不做接口、不被选择界面感知。
 
 如果只分一层（比如把 PnP 放 components，方案里 import 它），那"加一个新方案"和"改一个公共工具"的影响范围就分不开——改一个工具可能影响多个方案。

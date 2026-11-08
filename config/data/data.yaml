@@ -7,7 +7,7 @@ sim:
   sensor_fps: 50
   world_scale: 100.0
   # 像素噪声（px）。默认 0 = 理想观测，便于开发与自检可复现；
-  # 做贴近真实检测器的评测时建议开 0.3~0.5（旧项目实测 sigma=0.5 时 diff 的 psi 抖动 mean 5.4 度）。
+  # 做贴近真实检测器的评测时建议开 0.3~0.5。
   pixel_noise_sigma: 0.0
   pnp_method: ippe
   air_density: 1.2
@@ -54,9 +54,8 @@ sim:
     max_speed: 10.0
     max_rotate_speed: 20.0
     # 目标机动预设参数（KP7 循环 static / spin_slow / spin_fast / patrol 用）
-    # 两个小陀螺速度对应 MultiTargetParams.spin_thresh（默认 3.0 rad/s）的两侧：
-    spin_slow: 2.0               # rad/s，慢速小陀螺——低于阈值，车走 auto（追板）
-    spin_fast: 8.0               # rad/s，快速小陀螺——高于阈值，车走 single（虚拟点）
+    spin_slow: 2.0               # rad/s，慢速小陀螺
+    spin_fast: 8.0               # rad/s，快速小陀螺
     patrol_radius: 1.0           # m，圆周半径
     patrol_speed: 0.6            # m/s，切向线速度
     patrol_radial_gain: 3.0      # 1/s，径向校正增益

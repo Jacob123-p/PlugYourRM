@@ -8,7 +8,7 @@
         ↓ 内部遍历检测、调 components/armor_solvers、打包
     Observation
         ↓ tracker.step(obs, self_state)
-        ↓ 内部调 components/{armor_selectors, traj_solvers, shooters}
+        ↓ 内部按需调 components/traj_solvers（弹道）
         ↓ tracker 内部自己发 CONTROL（通过 public_bus）
     List[Prediction]
         ↓ 发 public_bus.pred/<type>

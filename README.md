@@ -15,7 +15,7 @@
 ## 它不是什么
 
 - **不是完整比赛系统**。没有裁判系统、没有通信协议、没有真车接口。
-- **不是"帮你写好自瞄"**。默认 tracker 只是一个能跑的 demo，从 EKF 到选板都可以换掉。
+- **不是"帮你写好自瞄"**。平台不给参考答案：只给工具（单板 PnP、弹道、滤波器），方案从零写。
 - **不是纯视觉项目**。相机是仿真的——你看到的是完美的针孔投影 + 像素量化 + 可选噪声，不用标定、不用对齐、不用处理真实世界的脏数据。
 
 ## 快速开始
@@ -43,21 +43,26 @@ python main.py
    - `KP8` —— 开/关自动开火
    - `R` —— 复位
 
+**进场先造一辆车** —— 场地一开始是空的：按 `Enter + 2` 造一辆步兵，它会自动成为受控车。没有受控车就没有相机、没有检测，方案一帧输入都收不到。
+
+**第一次跑起来云台不会动** —— `custom/schemes/your_scheme/` 里的方案还是空的：`solve()` 不产出观测、`step()` 不产出预测。这不是平台坏了，是留给你写的。
+
 ### 常用按键
 
-| 键 | 功能 |
-|---|---|
-| `WASD` | 底盘平移（场地轴） |
-| `A/D` | 底盘慢转，`Z/C` 快转 |
-| `Q/E` | 云台偏航，`W/X` 俯仰（自瞄关闭时） |
-| `Enter + 1/2/3/4` | 创建 Hero / Infantry / Sentry / Engineer |
-| `Enter + KP1/KP2` | 创建 Outpost / Rune |
-| `Backspace + 数字` | 删除对应实体 |
-| `KP9` / `KP8` | 自动瞄准 / 自动开火 |
-| `KP0` | 手动连发（不受自瞄约束，试弹道用） |
-| `M` / `KP4` | 曲线面板开关 / 切换预设 |
-| `R` / `Space` | 复位 / 急停 |
-| `ESC` | 退出当前局，回到选择界面 |
+| 键                   | 功能                                     |
+| -------------------- | ---------------------------------------- |
+| `↑↓←→`             | 底盘平移（场地轴）                       |
+| `A/D`              | 底盘慢转，`Z/C` 快转                   |
+| `Q/E`              | 云台偏航，`W/X` 俯仰（自瞄关闭时）     |
+| `Enter + 1/2/3/4`  | 创建 Hero / Infantry / Sentry / Engineer |
+| `Enter + KP1/KP2`  | 创建 Outpost / Rune                      |
+| `Backspace + 数字` | 删除对应实体                             |
+| `1`                | 切换受控车（场上有几辆车时轮换）         |
+| `KP9` / `KP8`    | 自动瞄准 / 自动开火                      |
+| `KP0`              | 手动连发（不受自瞄约束，试弹道用）       |
+| `M` / `KP4`      | 曲线面板开关 / 切换预设                  |
+| `R` / `Space`    | 复位 / 急停                              |
+| `ESC`              | 退出当前局，回到选择界面                 |
 
 ## 系统结构
 
@@ -77,8 +82,8 @@ sim/        世界。物理、传感器、电控、渲染、键盘。
   render/     渲染层
 
 custom/     方案 + 组件。你写代码的地方。
-  schemes/    完整 MOT 方案（Tracker + PoseSolver 实现）
-  components/ 可复用的库（选板、弹道、PnP 算法）
+  schemes/    一套方案（PoseSolver + Tracker 实现）
+  components/ 可复用的库（PnP、弹道）
   pipeline.py custom 内编排
   comm.py     custom 侧通信模块
 
@@ -95,43 +100,42 @@ sensor 出检测 ──→ SimComm ──→ [public_bus] ──→ CustomComm
                                                     ↓
                                               pipeline.tick
                                                     │
-                              ┌─────────────────────┼─────────────────────┐
-                              ↓                     ↓                     ↓
-                        PoseSolver.solve     Tracker.step          （可选）Trajectory
-                              ↓                     ↓
-                        Observation           Prediction
-                              └─────────────────────┤
                                                     ↓
-                                              [public_bus.pred/*]
+                                          PoseSolver.solve → Observation
                                                     │
-                              ┌─────────────────────┴─────────────────────┐
-                              ↓                                           ↓
-                        RenderManager                              ControlManager
-                        （画预测点）                                （驱动云台 + 开火）
+                                                    ↓
+                                    Tracker.step（跟踪 + 火控）→ Prediction
+                                                    │
+                            ┌───────────────────────┴───────────────────────┐
+                            ↓                                               ↓
+                    [public_bus.pred/*]                            [public_bus.control]
+                            ↓                                               ↓
+                      RenderManager                                  ControlManager
+                      （画预测点）                                    （驱动云台 + 开火）
 ```
 
 ## 写你自己的自瞄
 
-三条扩展路径，按难度排：
+**一套方案 = 一个 PoseSolver + 一个 Tracker。** `custom/schemes/your_scheme/` 里已经有骨架，把这两个实现写完，就是一套能跑的自瞄：
 
-### 1. 换一个 PnP 算法
-
-在 `custom/components/armor_solvers/` 下新开一个模块（照抄 `ippe.py` / `qcqp.py` / `diff.py` 中最近的一个），实现
-
-```python
-estimate(*, camera_k, armor_size, image_points_2d,
-         rot_camera_to_abs_camera, mount_pitch=0.0) -> (pos, rpy) | (None, None)
+```
+custom/schemes/your_scheme/
+├── __init__.py           包标记（没有它 discover() 扫不到这个目录）
+├── your_pose_solver.py   检测 → 观测：像素解成三维位姿
+└── your_tracker.py       观测 → 预测 + 火控：跟踪、选板、发 ShotSolution
 ```
 
-再在 `__init__.py` 的 `_SOLVERS` 和 `get_solver` 里登记。没有抽象基类。
+### 1. 位姿解算（先做这个）
 
-### 2. 换一个 Tracker
+`PoseSolver.solve(frame, self_state) -> Observation`：遍历 `frame.detections`，把每块板的四角像素解成三维位姿，打包成 `Observation`。
 
-复制 `custom/schemes/tjurm_scheme/` 到一个新目录，改 `tracker.py`，用 `@register_tracker("my_name")` 注册。启动界面就会多一列选项。
+单板 PnP 在 `custom/components/armor_solvers/` 里给了一份（`ippe`）：用它、换掉它、都不用，都行。真正的难点是换系——PnP 出口在 `C'` 系，你要换到 `G` 或 `W`。坐标约定见 `docs/coordinate_systems.md`。
 
-### 3. 从零写一个最小 Tracker
+### 2. 跟踪器（方案主体）
 
-不看默认实现，只按 `core/interfaces/tracker.py` 的契约走：
+`Tracker.step(obs, self_state) -> List[Prediction]`：一帧观测进，一帧预测出。用 `@register_tracker("my_name")` 注册，启动界面的 Tracker 列就会多一行。
+
+按 `core/interfaces/tracker.py` 的契约走：
 
 ```python
 from core.interfaces.tracker import Tracker, register_tracker
@@ -157,7 +161,26 @@ class MyFirstTracker(Tracker):
 
 **一帧观测进，一帧预测出**——这是 Tracker 的全部契约。
 
+**Prediction 只喂渲染，云台不认它。** 要让云台动，得在 `step()` 里自己把 `ShotSolution` 发到 `CONTROL` 通道——指南里有最小例子。
+
+**选板、火控、多目标关联都要你自己写** —— `custom/components/` 里只给单板 PnP 和弹道解算。
+
 详细的写作指南见 `docs/writing_your_tracker.md`。
+
+### 3. 换一个 PnP 算法（选做）
+
+在 `custom/components/armor_solvers/` 下新开一个模块（照抄 `ippe.py`），实现
+
+```python
+estimate(*, camera_k, armor_size, image_points_2d,
+         rot_camera_to_abs_camera, mount_pitch=0.0) -> (pos, rpy) | (None, None)
+```
+
+再在 `__init__.py` 的 `_SOLVERS` 里登记一行。没有抽象基类。
+
+## 想再写一套方案
+
+复制 `custom/schemes/your_scheme/` 改个名，换掉 `@register_*` 的名字。**新目录里必须有 `__init__.py`**——`discover()` 只扫包，没有它你写的代码不会被认到（表现是"我明明写了，选择界面里没有"）。
 
 ## 项目结构
 
@@ -185,12 +208,10 @@ PlugYourRM/
 │   └── render/
 ├── custom/                   # 方案 + 组件（你写这里）
 │   ├── schemes/
-│   │   └── tjurm_scheme/
+│   │   └── your_scheme/      # 你的方案：pose_solver + tracker
 │   ├── components/
-│   │   ├── armor_solvers/
-│   │   ├── armor_selectors/
-│   │   ├── traj_solvers/
-│   │   └── shooters/
+│   │   ├── armor_solvers/    # 单板 PnP（ippe）
+│   │   └── traj_solvers/     # 弹道
 │   ├── pipeline.py
 │   └── comm.py
 └── entrance/                 # 装配
@@ -198,21 +219,19 @@ PlugYourRM/
 
 ## 文档
 
-| 文档 | 内容 |
-|---|---|
-| `docs/architecture.md` | 分层、边界、稳定 vs 变化 |
-| `docs/writing_your_tracker.md` | 从零写一个 Tracker |
-| `docs/coordinate_systems.md` | 坐标系系统 |
-| `docs/bus_and_messages.md` | 总线、消息契约、异步模型 |
+| 文档                             | 内容                     |
+| -------------------------------- | ------------------------ |
+| `docs/architecture.md`         | 分层、边界、稳定 vs 变化 |
+| `docs/writing_your_tracker.md` | 从零写一个 Tracker       |
+| `docs/coordinate_systems.md`   | 坐标系系统               |
+| `docs/bus_and_messages.md`     | 总线、消息契约、异步模型 |
 
 ## 已知限制
 
 诚实列出：
 
-- **弹道解算是默认实现**，用了带阻力的数值迭代，不是解析解。理论上可换。
-- **`multi_target` 是唯一的完整方案**。写第二个方案时才能看出"schemes / components 分离"是否真的够用。
-- **MPC 默认关闭**。`custom/schemes/tjurm_scheme/mpc/` 里的代码保留着，但 `enable_mpc=False`——学生想用要自己打开并调试。
-- **能量机关（Rune）的解算没有做**。传感器给靶心位置，`RuneModel` 只用位置不用姿态——十环靶没有板面方向可解，这是设计选择。
+- **弹道解算给了一份现成的**（`custom/components/traj_solvers/`，带阻力的数值解，不是解析解）。不想用就自己写。
+- **单板 PnP 只给了一种**（`ippe`）。想换几何解，自己加一个模块。
 - **没有单元测试**。回归靠手动跑仿真。这是最应该补的一块。
 - **错误可见性有限**。`EventBus.publish` 的回调异常打到 stderr，不显示在游戏里——游戏里看到"卡住但没报错"时，记得看终端。
 
@@ -222,4 +241,4 @@ PlugYourRM/
 
 ---
 
-**下一步**：读 `docs/architecture.md`，然后 `docs/writing_your_tracker.md`，然后打开 `custom/schemes/tjurm_scheme/tracker.py` 看看默认实现。
+**下一步**：读 `docs/architecture.md`，然后 `docs/writing_your_tracker.md`
